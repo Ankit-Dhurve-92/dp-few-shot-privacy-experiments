@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-
+from dp_few_shot_generation.local_gpt2 import LocalGPT2
 import asyncio
 import math
 import re
@@ -17,6 +17,7 @@ import openai
 import scipy.special
 import tqdm
 import typer
+import json
 from datasets import DatasetDict, load_dataset
 from lmapi.lm import LM, CompletionsSettings
 from lmapi.openai import client_session
@@ -92,58 +93,63 @@ def chunks(lst, n):
         yield lst[i : i + n]
 
 
+def local_label_probs(prompt, model):
+    """Score the four AGNEWS labels using local GPT-2."""
+    import torch
+
+    candidates = [" World", " Sports", " Business", " Technology"]
+    inputs = model.tokenizer(prompt, return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    scores = []
+    with torch.no_grad():
+        for label in candidates:
+            label_ids = model.tokenizer(
+                label, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"].to(model.device)
+
+            combined = torch.cat(
+                [inputs["input_ids"], label_ids], dim=1
+            )
+            attention_mask = torch.ones_like(combined)
+
+            logits = model.model(
+                input_ids=combined,
+                attention_mask=attention_mask
+            ).logits
+
+            start = inputs["input_ids"].shape[1] - 1
+            token_log_probs = torch.log_softmax(
+                logits[0, start:start + label_ids.shape[1], :], dim=-1
+            )
+            target_ids = label_ids[0]
+            score = token_log_probs[
+                torch.arange(len(target_ids)), target_ids
+            ].sum().item()
+            scores.append(score)
+
+    scores = torch.tensor(scores)
+    return torch.softmax(scores, dim=0).cpu().numpy()
+
+
+
 def get_model_response(data, test_examples, openai_model):
+    model = LocalGPT2()
     all_raw_answers = []
 
-    prompts = []
-    train_examples = data
-
-    for test_example in test_examples:
-        prompts.append(construct_prompt_same(train_examples, test_example))
-
-    chunked_prompts = list(chunks(prompts, 20))
-    for test_chunk in chunked_prompts:
-        response = complete(test_chunk, l=1, model_name=openai_model, num_log_probs=100)
-
-        for answer_id, answer in enumerate(response["choices"]):
-            all_raw_answers.append(answer)
+    for test_example in tqdm.tqdm(test_examples):
+        prompt = construct_prompt_same(data, test_example)
+        probs = local_label_probs(prompt, model)
+        all_raw_answers.append(probs)
 
     return all_raw_answers
 
 
+
+
 def get_label_probs(all_raw_answers, test_subset):
-    """Obtain model's label probability for each of the test examples. The returned prob is NOT normalized"""
-    num_classes = len(label_dict)
-    approx = False
-    assert len(all_raw_answers) == len(test_subset)
-
-    # Fill in the labels that is in the top k prob
-    all_label_probs = []
-    all_missing_positions = []
-    cnt = 0
-    for i, ans in enumerate(all_raw_answers):
-        try:
-            top_logprobs = ans["logprobs"]["top_logprobs"][
-                0
-            ]  # [0] since we only ask for complete one more token
-        except:
-            cnt += 1  # cnt for corner case
-        label_probs = [0] * len(label_dict.keys())
-        for j, label_list in label_dict.items():
-            all_found = True
-            for label in label_list:  # each possible label correspond to the same class
-                label = " " + label  # notice prompt does not have space after 'A:'
-                if label in top_logprobs:
-                    label_probs[j] += np.exp(top_logprobs[label])
-                else:
-                    all_found = False
-            if not all_found:
-                position = (i, j)  # (which test example, which label)
-                all_missing_positions.append(position)
-        all_label_probs.append(label_probs)
-    all_label_probs = np.array(all_label_probs)  # prob not normalized
-
-    return all_label_probs  # NOT NORMALIZED
+    """Return local GPT-2 label probabilities."""
+    return np.asarray(all_raw_answers, dtype=float)
 
 
 def eval_accuracy(all_label_probs, test_labels, mode=None, p_cf=None):
@@ -180,24 +186,22 @@ def eval_accuracy(all_label_probs, test_labels, mode=None, p_cf=None):
     return np.mean(correctness_list)
 
 
+
 def get_p_content_free(train_subset, openai_model, content_free_inputs=("N/A",)):
-    """Query model with content free input, return its prediction probability for each label"""
+    """Estimate class probabilities on content-free inputs using local GPT-2."""
+    model = LocalGPT2()
     all_p_y = []
+
     for content_free_input in content_free_inputs:
-        prompt = construct_prompt_same(train_subset, content_free_input)
-        p_y = [0] * len(label_dict)
-        for i, answers in label_dict.items():
-            prob = 0
-            for a in answers:
-                prob += np.exp(
-                    complete(
-                        prompt + " " + a, 0, openai_model, echo=True, num_log_probs=1
-                    )["choices"][0]["logprobs"]["token_logprobs"][-1]
-                )
-            p_y[i] = prob
+        prompt = construct_prompt_same(
+            train_subset,
+            {"text": content_free_input["text"], "label": 0}
+            )
+        p_y = local_label_probs(prompt, model)
         all_p_y.append(p_y)
+
     p_y = np.mean(np.array(all_p_y), axis=0)
-    p_y = p_y / np.sum(p_y)  # normalize
+    p_y = p_y / np.sum(p_y)
     return p_y
 
 
@@ -463,7 +467,7 @@ def select_uniform_n_shots_over_labels(data, n_shots):
 def _main(
     sigma: Annotated[float, typer.Option()],  # noise parameters
     openai_model: Annotated[str, typer.Option()] = "babbage",
-    print_prompts: Annotated[bool, typer.Option()] = False,
+    print_prompts: bool = False,
     # num_private_train=MN. MN=0 with num_valid=4 will get epsilon=0 (4-shot) results.
     num_private_train: Annotated[int, typer.Option()] = DEFAULT_NUM_PRIVATE_TRAIN,
     # by default set to 0. set_num_public_train >0 indicates additional public data available.
@@ -474,16 +478,16 @@ def _main(
     num_private_train_splits: Annotated[
         int, typer.Option()
     ] = DEFAULT_NUM_PRIVATE_TRAIN_SPLITS,
-    num_test: Annotated[int, typer.Option()] = DEFAULT_NUM_TEST,
+    num_test: Annotated[int, typer.Option()] = 100,
     # no_public_token=True, RVP=False; no_public_token=False, RVP=True
-    no_public_token: Annotated[bool, typer.Option()] = False,
+    no_public_token: bool = False,
     # subsample_per_token=True: at each token generation, subsample a new test set
-    subsample_per_token: Annotated[bool, typer.Option()] = False,
-    use_dp_prompts: Annotated[bool, typer.Option()] = False,
+    subsample_per_token: bool = False,
+    use_dp_prompts: bool = False,
     # sample_same_label_prompts=True: sample subsets from the sets with same targeted labels.
-    sample_same_label_prompts: Annotated[bool, typer.Option()] = False,
+    sample_same_label_prompts: bool = False,
     # normalize_max=True, Exponential mechanism; normalize_max=False, Gaussian mechanism
-    normalize_max: Annotated[bool, typer.Option()] = False,
+    normalize_max: bool = False,
     # max_token_per_text=T_max
     max_token_per_text: Annotated[int, typer.Option()] = 100,
     # consistent with default parameters in the documentation https://learn.microsoft.com/en-us/azure/cognitive-services/openai/reference#completions
@@ -517,7 +521,7 @@ def _main(
         else:
             num_public_train = set_num_public_train
 
-        lm = api_openai_com(openai_model)
+        lm = LocalGPT2()
         noise_rng = np.random.RandomState()
 
         data = cast(DatasetDict, load_dataset("ag_news"))
@@ -630,6 +634,8 @@ def _main(
                     output_datum["text"] = generated.strip()
                     output_datum["label"] = test_datum["label"]
                     synthetic_examples.append(output_datum)
+                    with open("privacy_analysis/results/agnews_dp_synthetic.json", "w", encoding="utf-8") as f: json.dump(synthetic_examples, f, indent=2, ensure_ascii=False)
+                    
 
         if num_test > 0:
             test_subset = (
